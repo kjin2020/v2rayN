@@ -7,7 +7,14 @@ public static class ProxySettingWindows
 {
     private const string _regPath = @"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
-    private static bool SetProxyFallback(string? strProxy, string? exceptions, int type)
+    /// <summary>
+    /// Write the classic registry values (an empty value removes it).
+    /// Applications that follow the system proxy without going through WinINet
+    /// (e.g. Firefox) read these values directly and treat a present AutoConfigURL
+    /// as an active PAC regardless of any flags, so a leftover value must be
+    /// deleted here, not just disabled via the connection flags.
+    /// </summary>
+    private static bool SetProxyRegistry(string? strProxy, string? exceptions, int type)
     {
         if (type == 1)
         {
@@ -16,7 +23,7 @@ public static class ProxySettingWindows
             WindowsUtils.RegWriteValue(_regPath, "ProxyOverride", string.Empty);
             WindowsUtils.RegWriteValue(_regPath, "AutoConfigURL", string.Empty);
         }
-        if (type == 2)
+        else if (type == 2)
         {
             WindowsUtils.RegWriteValue(_regPath, "ProxyEnable", 1);
             WindowsUtils.RegWriteValue(_regPath, "ProxyServer", strProxy ?? string.Empty);
@@ -57,74 +64,67 @@ public static class ProxySettingWindows
     /// <returns>true: one of connection is successfully updated proxy settings</returns>
     public static bool SetProxy(string? strProxy, string? exceptions, int type)
     {
+        var result = false;
         try
         {
             // set proxy for LAN
-            var result = SetConnectionProxy(null, strProxy, exceptions, type);
+            result = SetConnectionProxy(null, strProxy, exceptions, type);
             // set proxy for dial up connections
             var connections = EnumerateRasEntries();
             foreach (var connection in connections)
             {
                 result |= SetConnectionProxy(connection, strProxy, exceptions, type);
             }
-            return result;
         }
         catch
         {
-            _ = SetProxyFallback(strProxy, exceptions, type);
-            return false;
+            result = false;
         }
+
+        // The WinINet per-connection API keeps the previous mode's registry values
+        // (especially AutoConfigURL) behind, so always enforce them, not only as a fallback
+        _ = SetProxyRegistry(strProxy, exceptions, type);
+
+        // Notify the system that the settings have been changed and cause them to be refreshed
+        _ = NativeMethods.InternetSetOption(nint.Zero, InternetOption.INTERNET_OPTION_SETTINGS_CHANGED, nint.Zero, 0);
+        _ = NativeMethods.InternetSetOption(nint.Zero, InternetOption.INTERNET_OPTION_REFRESH, nint.Zero, 0);
+
+        return result;
     }
 
     private static bool SetConnectionProxy(string? connectionName, string? strProxy, string? exceptions, int type)
     {
         var list = new InternetPerConnOptionList();
 
-        var optionCount = 1;
-        if (type == 1) // No proxy
+        var m_Int = type switch
         {
-            optionCount = 1;
-        }
-        else if (type is 2 or 4) // named proxy or autoproxy script URL
-        {
-            optionCount = exceptions.IsNullOrEmpty() ? 2 : 3;
-        }
+            2 => (int)(PerConnFlags.PROXY_TYPE_DIRECT | PerConnFlags.PROXY_TYPE_PROXY), // named proxy
+            4 => (int)(PerConnFlags.PROXY_TYPE_DIRECT | PerConnFlags.PROXY_TYPE_AUTO_PROXY_URL), // autoproxy script URL
+            _ => (int)PerConnFlags.PROXY_TYPE_DIRECT // no proxy
+        };
 
-        var m_Int = (int)PerConnFlags.PROXY_TYPE_DIRECT;
-        var m_Option = PerConnOption.INTERNET_PER_CONN_FLAGS;
-        if (type == 2) // named proxy
-        {
-            m_Int = (int)(PerConnFlags.PROXY_TYPE_DIRECT | PerConnFlags.PROXY_TYPE_PROXY);
-            m_Option = PerConnOption.INTERNET_PER_CONN_PROXY_SERVER;
-        }
-        else if (type == 4) // autoproxy script url
-        {
-            m_Int = (int)(PerConnFlags.PROXY_TYPE_DIRECT | PerConnFlags.PROXY_TYPE_AUTO_PROXY_URL);
-            m_Option = PerConnOption.INTERNET_PER_CONN_AUTOCONFIG_URL;
-        }
-
-        var options = new InternetConnectionOption[optionCount];
+        // Always write every option: setting only the options of the current mode keeps
+        // the previous mode's proxy server or autoconfig URL stored in the connection
+        // settings, where applications following the system proxy may still pick them up
+        var options = new InternetConnectionOption[4];
         // USE a proxy server ...
         options[0].m_Option = PerConnOption.INTERNET_PER_CONN_FLAGS;
         options[0].m_Value.m_Int = m_Int;
         // use THIS proxy server
-        if (optionCount > 1)
-        {
-            options[1].m_Option = m_Option;
-            options[1].m_Value.m_StringPtr = Marshal.StringToHGlobalAuto(strProxy); // !! remember to deallocate memory 1
-                                                                                    // except for these addresses ...
-            if (optionCount > 2)
-            {
-                options[2].m_Option = PerConnOption.INTERNET_PER_CONN_PROXY_BYPASS;
-                options[2].m_Value.m_StringPtr = Marshal.StringToHGlobalAuto(exceptions); // !! remember to deallocate memory 2
-            }
-        }
+        options[1].m_Option = PerConnOption.INTERNET_PER_CONN_PROXY_SERVER;
+        options[1].m_Value.m_StringPtr = Marshal.StringToHGlobalAuto(type == 2 ? strProxy ?? string.Empty : string.Empty); // !! remember to deallocate memory 1
+        // except for these addresses ...
+        options[2].m_Option = PerConnOption.INTERNET_PER_CONN_PROXY_BYPASS;
+        options[2].m_Value.m_StringPtr = Marshal.StringToHGlobalAuto(type == 2 ? exceptions ?? string.Empty : string.Empty); // !! remember to deallocate memory 2
+        // use THIS autoproxy script ...
+        options[3].m_Option = PerConnOption.INTERNET_PER_CONN_AUTOCONFIG_URL;
+        options[3].m_Value.m_StringPtr = Marshal.StringToHGlobalAuto(type == 4 ? strProxy ?? string.Empty : string.Empty); // !! remember to deallocate memory 3
 
         // default stuff
         list.dwSize = Marshal.SizeOf(list);
         if (connectionName != null)
         {
-            list.szConnection = Marshal.StringToHGlobalAuto(connectionName); // !! remember to deallocate memory 3
+            list.szConnection = Marshal.StringToHGlobalAuto(connectionName); // !! remember to deallocate memory 4
         }
         else
         {
@@ -135,7 +135,7 @@ public static class ProxySettingWindows
 
         var optSize = Marshal.SizeOf(typeof(InternetConnectionOption));
         // make a pointer out of all that ...
-        var optionsPtr = Marshal.AllocCoTaskMem(optSize * options.Length); // !! remember to deallocate memory 4
+        var optionsPtr = Marshal.AllocCoTaskMem(optSize * options.Length); // !! remember to deallocate memory 5
                                                                            // copy the array over into that spot in memory ...
         for (var i = 0; i < options.Length; ++i)
         {
@@ -154,7 +154,7 @@ public static class ProxySettingWindows
         list.options = optionsPtr;
 
         // and then make a pointer out of the whole list
-        var ipcoListPtr = Marshal.AllocCoTaskMem(list.dwSize); // !! remember to deallocate memory 5
+        var ipcoListPtr = Marshal.AllocCoTaskMem(list.dwSize); // !! remember to deallocate memory 6
         Marshal.StructureToPtr(list, ipcoListPtr, false);
 
         // and finally, call the API method!
@@ -166,32 +166,21 @@ public static class ProxySettingWindows
         {  // get the error codes, they might be helpful
             returnvalue = Marshal.GetLastPInvokeError();
         }
-        else
-        {
-            // Notify the system that the registry settings have been changed and cause them to be refreshed
-            _ = NativeMethods.InternetSetOption(nint.Zero, InternetOption.INTERNET_OPTION_SETTINGS_CHANGED, nint.Zero, 0);
-            _ = NativeMethods.InternetSetOption(nint.Zero, InternetOption.INTERNET_OPTION_REFRESH, nint.Zero, 0);
-        }
 
         // FREE the data ASAP
         if (list.szConnection != nint.Zero)
         {
-            Marshal.FreeHGlobal(list.szConnection); // release mem 3
+            Marshal.FreeHGlobal(list.szConnection); // release mem 4
         }
-        if (optionCount > 1)
-        {
-            Marshal.FreeHGlobal(options[1].m_Value.m_StringPtr); // release mem 1
-            if (optionCount > 2)
-            {
-                Marshal.FreeHGlobal(options[2].m_Value.m_StringPtr); // release mem 2
-            }
-        }
-        Marshal.FreeCoTaskMem(optionsPtr); // release mem 4
-        Marshal.FreeCoTaskMem(ipcoListPtr); // release mem 5
+        Marshal.FreeHGlobal(options[1].m_Value.m_StringPtr); // release mem 1
+        Marshal.FreeHGlobal(options[2].m_Value.m_StringPtr); // release mem 2
+        Marshal.FreeHGlobal(options[3].m_Value.m_StringPtr); // release mem 3
+        Marshal.FreeCoTaskMem(optionsPtr); // release mem 5
+        Marshal.FreeCoTaskMem(ipcoListPtr); // release mem 6
         if (returnvalue != 0)
         {
             // throw the error codes, they might be helpful
-            throw new ApplicationException($"Set Internet Proxy failed with error code: {Marshal.GetLastWin32Error()}");
+            throw new ApplicationException($"Set Internet Proxy failed with error code: {returnvalue}");
         }
 
         return true;
